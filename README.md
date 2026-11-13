@@ -7,7 +7,8 @@ information, please see [the documentation](https://docs.dissect.tools/en/latest
 
 This project is part of the Dissect framework and requires Python.
 
-Information on the supported Python versions can be found in the Getting Started section of [the documentation](https://docs.dissect.tools/en/latest/index.html#getting-started).
+Information on the supported Python versions can be found in the Getting Started section of [the
+documentation](https://docs.dissect.tools/en/latest/index.html#getting-started).
 
 ## Installation
 
@@ -19,7 +20,8 @@ pip install dissect.btrfs
 
 This project decompresses LZO compressed file systems and can use a faster, native (Rust-based) LZO implementation,
 instead of a slower pure Python implementation. Both implementations are provided by `dissect.util`.
-Pre-build wheels are available for most common platforms and the native implementation will automatically be used if available.
+Pre-build wheels are available for most common platforms and the native implementation will automatically be used if
+available.
 In the rare case that a pre-build wheel is not available, please refer to `dissect.util` for build instructions.
 
 ## Build and test instructions
@@ -42,6 +44,55 @@ tox
 
 For a more elaborate explanation on how to build and test the project, please see [the
 documentation](https://docs.dissect.tools/en/latest/contributing/tooling.html).
+
+## Multi-device forensic intake
+
+Btrfs devices of one filesystem often carry superblocks from different
+transactions when they are collected at different times, and a transaction can
+span devices. Selecting "the newest superblock" and merging whatever devices are
+present is therefore not enough to claim a consistent state: it can combine a
+newer metadata root with older data or chunk mappings.
+
+The library refuses the two dangerous merges by default:
+
+- two supplied images that claim the same `devid`
+- two chunk items that map the same logical range differently, or a stripe whose
+  `dev_uuid` does not match the supplied device
+
+Use `dissect.btrfs.examine` before opening a filesystem to record what a
+collection can and cannot prove:
+
+```python
+from dissect.btrfs import Btrfs, examine, verify_file_data
+
+report = examine(images)
+print(report.describe())          # verdict: proven / unverified / rejected
+
+if report.verdict.value != "rejected":
+    fs = Btrfs(images)
+    print(verify_file_data(fs, "path/to/file"))
+```
+
+A `proven` verdict means every referenced member is present and every compared
+chunk mapping agrees. It does **not** mean the directory tree is a consistent
+snapshot: only reading every reachable tree block against its checksum and the
+generation recorded by its parent establishes that, which `Btrfs` does while
+parsing. A filesystem can be perfectly parseable and still be `unverified` when a
+mirror is missing.
+
+Intake rules in short:
+
+- refuse a set with a duplicate `devid`, regardless of generation
+- refuse a set whose members disagree on a chunk mapping or a stripe's `dev_uuid`
+- treat a missing mirror as `unverified`, never as `proven`
+- record per-member generations; different generations mean the collection is
+  not one point in time, even when every block is individually valid
+- verify tree blocks and file data separately; neither substitutes for the other
+
+`Btrfs(..., strict=True)` verifies every reachable tree block's checksum,
+`bytenr`, fsid, owner, level and the generation recorded by its parent pointer.
+Use `strict=False` only for damaged media, and treat every result from it as
+unverified.
 
 ## Contributing
 

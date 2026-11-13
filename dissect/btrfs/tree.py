@@ -4,6 +4,7 @@ from functools import lru_cache
 from typing import TYPE_CHECKING, Literal
 
 from dissect.btrfs.c_btrfs import c_btrfs
+from dissect.btrfs.exceptions import InvalidTreeBlockError
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
@@ -20,9 +21,20 @@ class BTree:
         btrfs: The filesystem this B-tree belongs to.
         root_item: Optional ``btrfs_root_item`` to open the B-tree from.
         root_offset: Optional offset to open the B-tree from.
+        owner: Expected object ID of the tree owner. Defaults to the root item's object ID when known.
+        generation: Expected generation of the root block. Defaults to the root item's generation.
+        level: Expected level of the root block. Defaults to the root item's level.
     """
 
-    def __init__(self, btrfs: Btrfs, root_item: c_btrfs.btrfs_root_item | None = None, root_offset: int | None = None):
+    def __init__(
+        self,
+        btrfs: Btrfs,
+        root_item: c_btrfs.btrfs_root_item | None = None,
+        root_offset: int | None = None,
+        owner: int | None = None,
+        generation: int | None = None,
+        level: int | None = None,
+    ):
         self.btrfs = btrfs
 
         if not root_item and not root_offset:
@@ -30,6 +42,9 @@ class BTree:
 
         self.root_item = root_item
         self.root_offset = root_offset or root_item.bytenr
+        self.owner = owner
+        self.generation = generation if generation is not None else (root_item and root_item.generation)
+        self.level = level if level is not None else (root_item and root_item.level)
 
         self._read_node = lru_cache(8192)(self._read_node)
 
@@ -53,14 +68,24 @@ class BTree:
 
         return cursor.get()
 
-    def _read_node(self, address: int) -> tuple[memoryview, c_btrfs.btrfs_header]:
+    def _read_node(
+        self, address: int, generation: int | None = None, level: int | None = None
+    ) -> tuple[memoryview, c_btrfs.btrfs_header]:
         """Helper method for reading a node in the B-tree.
 
         Args:
             address: The address of the node to read.
+            generation: Optional expected generation from the referencing key pointer.
+            level: Optional expected level from the referencing key pointer.
         """
         node = memoryview(self.btrfs._read_node(address))
+        if len(node) < self.btrfs.node_size:
+            raise InvalidTreeBlockError(
+                f"Tree block at {address:#x} is truncated: {len(node)} of {self.btrfs.node_size} bytes"
+            )
         header = c_btrfs.btrfs_header(node)
+
+        self.btrfs._verify_tree_block(address, node, header, self.owner, generation, level)
 
         return node, header
 
@@ -91,21 +116,33 @@ class Cursor:
         self._items = {}
         self._index = None
         self._path = []
-        self.push(self.btree.root_offset)
+        self.push(self.btree.root_offset, generation=self.btree.generation, level=self.btree.level)
 
-    def push(self, address: int, initial_index: int = 0) -> None:
+    def push(
+        self,
+        address: int,
+        initial_index: int = 0,
+        generation: int | None = None,
+        level: int | None = None,
+    ) -> None:
         """Push the cursor down a node.
 
         Args:
             address: The address of the node to push down to.
             initial_index: The initial index to seek to in the new node. ``-1`` means the last item.
+            generation: Optional expected generation of the node, from the referencing key pointer.
+            level: Optional expected level of the node, from the referencing key pointer.
         """
         self._path.append((self._node, self._header, self._keys, self._items, self._index))
 
-        self._node, self._header = self.btree._read_node(address)
+        self._node, self._header = self.btree._read_node(address, generation, level)
         self._keys = {}
         self._items = {}
         self._index = self._header.nritems if initial_index == -1 else initial_index
+
+    def _push_item(self, item: c_btrfs.btrfs_key_ptr, initial_index: int = 0) -> None:
+        """Push the cursor down a branch item, validating its expected generation and level."""
+        self.push(item.blockptr, initial_index, generation=item.generation, level=self._header.level - 1)
 
     def pop(self) -> None:
         """Pop up a node."""
@@ -153,7 +190,7 @@ class Cursor:
         """
         self.next_node()
         while self._header.level:
-            self.push(self.item().blockptr)
+            self._push_item(self.item())
 
     def next_node(self) -> None:
         """Traverse to the next node.
@@ -168,7 +205,7 @@ class Cursor:
 
         self._index += 1
         if self._header.level:
-            self.push(self.item().blockptr)
+            self._push_item(self.item())
 
     def prev(self) -> None:
         """Traverse to the previous leaf item.
@@ -177,7 +214,7 @@ class Cursor:
         """
         self.prev_node()
         while self._header.level:
-            self.push(self.item().blockptr, -1)
+            self._push_item(self.item(), -1)
 
     def prev_node(self) -> None:
         """Traverse to the previous leaf item.
@@ -192,20 +229,20 @@ class Cursor:
 
         self._index -= 1
         if self._header.level:
-            self.push(self.item().blockptr, -1)
+            self._push_item(self.item(), -1)
 
     def first(self) -> None:
         """Move the cursor to the first leaf item."""
         self.reset()
         while self._header.level:
-            self.push(self.item().blockptr)
+            self._push_item(self.item())
 
     def last(self) -> None:
         """Move the cursor to the last leaf item."""
         self.reset()
         self._index = self._header.nritems - 1
         while self._header.level:
-            self.push(self.item().blockptr, -1)
+            self._push_item(self.item(), -1)
 
     def get(self) -> tuple[c_btrfs.btrfs_item, memoryview]:
         """Retrieve the leaf item and the associated data at the current cursor position.
@@ -328,7 +365,7 @@ class Cursor:
                     # we must traverse down the previous node
                     min_idx -= 1
                 self._index = min_idx
-                self.push(self._read_item(min_idx).blockptr)
+                self._push_item(self._read_item(min_idx))
                 continue
 
             if result >= 0:

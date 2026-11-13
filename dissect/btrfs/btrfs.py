@@ -7,6 +7,8 @@ from __future__ import annotations
 
 import io
 import stat
+import struct
+from dataclasses import dataclass
 from functools import cache, cached_property, lru_cache
 from typing import TYPE_CHECKING, BinaryIO
 from uuid import UUID
@@ -17,10 +19,14 @@ from dissect.util.stream import BufferedStream
 
 from dissect.btrfs.c_btrfs import FT_MAP, c_btrfs
 from dissect.btrfs.exceptions import (
-    Error,
+    ConflictingDeviceError,
     FileNotFoundError,
+    InconsistentFilesystemError,
+    InvalidSuperblockError,
+    InvalidTreeBlockError,
     NotADirectoryError,
     NotASymlinkError,
+    UnsupportedChecksumError,
 )
 from dissect.btrfs.stream import ChunkStream, Extent, ExtentStream, decode_extent
 from dissect.btrfs.tree import BTree
@@ -30,45 +36,166 @@ if TYPE_CHECKING:
     from datetime import datetime
 
 
+BTRFS_SUPER_MIRRORS = (0x10000, 0x4000000, 0x4000000000)
+BTRFS_SUPER_INFO_SIZE = 0x1000
+BTRFS_ROOT_TREE_OBJECTID = 1
+BTRFS_CHUNK_TREE_OBJECTID = 3
+BTRFS_EXTENT_CSUM_OBJECTID = -10
+
+
+@dataclass(frozen=True)
+class SuperblockCopy:
+    """A superblock mirror as found on one device image."""
+
+    offset: int
+    generation: int
+    checksum_valid: bool
+    sb: c_btrfs.btrfs_super_block
+    raw: bytes
+    checksum_type_supported: bool = True
+
+
+def read_superblock_copies(fh: BinaryIO) -> list[SuperblockCopy]:
+    """Read all valid-looking superblock mirrors from a device image.
+
+    Only mirrors with the Btrfs magic at the expected address are returned.  A
+    mirror with a bad checksum is still returned, with ``checksum_valid`` set to
+    ``False``, so callers can distinguish "corrupt" from "absent".
+    """
+    copies = []
+    for offset in BTRFS_SUPER_MIRRORS:
+        try:
+            fh.seek(offset)
+            raw = fh.read(BTRFS_SUPER_INFO_SIZE)
+        except (OSError, ValueError):
+            continue
+
+        if len(raw) < BTRFS_SUPER_INFO_SIZE:
+            continue
+        if struct.unpack_from("<Q", raw, 0x40)[0] != c_btrfs.BTRFS_MAGIC:
+            continue
+
+        sb = c_btrfs.btrfs_super_block(io.BytesIO(raw))
+        if sb.bytenr != offset:
+            continue
+
+        supported = sb.csum_type == 0
+        checksum_valid = False
+        if supported:
+            stored = struct.unpack_from("<I", raw, 0)[0]
+            checksum_valid = stored == (crc32c.update(0, raw[0x20:]) & 0xFFFFFFFF)
+
+        copies.append(
+            SuperblockCopy(
+                offset=offset,
+                generation=sb.generation,
+                checksum_valid=checksum_valid,
+                sb=sb,
+                raw=raw,
+                checksum_type_supported=supported,
+            )
+        )
+
+    return copies
+
+
+def metadata_uuid_of(sb: c_btrfs.btrfs_super_block) -> UUID:
+    """Return the UUID that identifies the filesystem's metadata."""
+    raw = bytes(sb.metadata_uuid)
+    return UUID(bytes=raw) if any(raw) else UUID(bytes=bytes(sb.fsid))
+
+
+def _validate_superblock_identity(sb: c_btrfs.btrfs_super_block) -> None:
+    if bytes(sb.dev_item.fsid) != bytes(sb.fsid):
+        raise InvalidSuperblockError(
+            f"Superblock fsid {UUID(bytes=bytes(sb.fsid))} does not match device fsid "
+            f"{UUID(bytes=bytes(sb.dev_item.fsid))}"
+        )
+
+
 class Btrfs:
     """Btrfs filesystem implementation.
 
     This implementation supports most basic Btrfs features such as subvolumes, compression and (meta)data RAID.
     To open a RAID volume, simply pass all file-like objects that belong to the RAID set as a list.
 
+    Every supplied image is treated as a whole-device image: its superblock mirror is read at the standard
+    ``0x10000`` offset.  Supplying two images that carry the same ``devid`` is refused rather than silently
+    picking one, because doing so can splice metadata from different collection times into one filesystem.
+
     Args:
         fh: A file-like object for the volume to use for parsing Btrfs.
+        member: Optional index into ``fhs`` selecting whose superblock to prefer.  Without it the highest
+            validated generation is used; equal generations are resolved deterministically by devid and
+            mirror offset, which only changes which checksum-valid copy is read.  A member cannot override
+            a duplicate devid or a chunk map conflict.
+        strict: Verify superblock checksums, tree block checksums, addresses, fsids, owners and generations
+            while reading.  Disabling this is only appropriate for damaged images and makes every result
+            unverified.
     """
 
-    def __init__(self, fh: BinaryIO | list[BinaryIO]):
+    def __init__(
+        self,
+        fh: BinaryIO | list[BinaryIO],
+        member: int | None = None,
+        strict: bool = True,
+    ):
         self.fhs = fh if isinstance(fh, list) else [fh]
 
         if not self.fhs:
             raise ValueError("At least one file-like object is required")
 
+        self.strict = strict
+        self.sb_copies: dict[int, list[SuperblockCopy]] = {}
+
         sb_fhs = []
         for fh in self.fhs:
-            fh.seek(c_btrfs.BTRFS_SUPER_INFO_OFFSET)
-            sb = c_btrfs.btrfs_super_block(fh)
-            if sb.magic != c_btrfs.BTRFS_MAGIC:
-                raise Error("Invalid btrfs superblock")
-            sb_fhs.append((sb, fh))
+            copies = read_superblock_copies(fh)
+            if not copies:
+                raise InvalidSuperblockError("Invalid btrfs superblock")
 
-        if len({sb.fsid for sb, _ in sb_fhs}) > 1:
+            usable = [copy for copy in copies if copy.checksum_valid or not copy.checksum_type_supported]
+            if not usable:
+                raise InvalidSuperblockError("No superblock copy with a valid checksum")
+
+            _validate_superblock_identity(usable[0].sb)
+            self.sb_copies[id(fh)] = copies
+            sb_fhs.append((fh, usable))
+
+        for fh, copies in sb_fhs:
+            if len({bytes(copy.sb.fsid) for copy in copies}) > 1:
+                raise InconsistentFilesystemError(f"Superblock mirrors on one image disagree on fsid: {fh!r}")
+
+        if len({bytes(copy.sb.fsid) for _, copies in sb_fhs for copy in copies}) > 1:
             raise ValueError("Only file-like objects of the same filesystem UUID can be used")
 
-        sb_fhs = sorted(sb_fhs, key=lambda item: item[0].generation, reverse=True)
+        metadata_uuids = {metadata_uuid_of(copy.sb) for _, copies in sb_fhs for copy in copies}
+        if len(metadata_uuids) > 1:
+            raise InconsistentFilesystemError(
+                f"Images share an fsid but disagree on metadata UUID: {', '.join(sorted(map(str, metadata_uuids)))}"
+            )
 
-        self.sb = sb_fhs[0][0]
+        self._bind_devices(sb_fhs)
+        selected = self._select_superblock(sb_fhs, member)
+        self.sb = selected.sb
+
+        if not selected.checksum_type_supported:
+            raise UnsupportedChecksumError(f"Unsupported superblock checksum type: {self.sb.csum_type}")
+
         self.sector_size = self.sb.sectorsize
         self.node_size = self.sb.nodesize
         self.stripe_size = self.sb.stripesize
 
-        self.label = self.sb.label.split(b"\x00")[0].decode()
-        self.uuid = UUID(bytes=self.sb.fsid)
-        self.metadata_uuid = UUID(bytes=self.sb.metadata_uuid)
+        self.newest_generation = self._highest_generation(sb_fhs)
+        self.member_generations = {
+            copy.sb.dev_item.devid: max(copy.generation for copy in copies)
+            for _, copies in sb_fhs
+            for copy in copies
+        }
 
-        self.devices = {sb.dev_item.devid: fh for sb, fh in sb_fhs}
+        self.label = self.sb.label.split(b"\x00")[0].decode()
+        self.uuid = UUID(bytes=bytes(self.sb.fsid))
+        self.metadata_uuid = metadata_uuid_of(self.sb)
 
         self._open_tree = lru_cache(32)(self._open_tree)
         self.open_subvolume = lru_cache(16)(self.open_subvolume)
@@ -76,12 +203,148 @@ class Btrfs:
         self._logical_fh = ChunkStream(self)
         self._initialize_chunks()
 
-        self._root_tree = BTree(self, root_offset=self.sb.root)
+        self._root_tree = BTree(
+            self,
+            root_offset=self.sb.root,
+            owner=BTRFS_ROOT_TREE_OBJECTID,
+            generation=self.sb.generation,
+            level=self.sb.root_level,
+        )
 
         self.fs_tree = self.open_subvolume(c_btrfs.BTRFS_FS_TREE_OBJECTID)
 
         self.default_subvolume = self._open_default_subvolume()
         self.root = self.default_subvolume.root
+
+    @staticmethod
+    def _highest_generation(sb_fhs: list[tuple[BinaryIO, list[SuperblockCopy]]]) -> int:
+        return max(copy.generation for _, copies in sb_fhs for copy in copies)
+
+    def _select_superblock(
+        self, sb_fhs: list[tuple[BinaryIO, list[SuperblockCopy]]], member: int | None
+    ) -> SuperblockCopy:
+        """Select the superblock copy to open.
+
+        All devices of a healthy multi-device filesystem normally carry the same
+        newest generation, while devices collected earlier legitimately carry
+        older superblocks; a lower generation is recorded, not rejected.  A
+        duplicate devid (see :meth:`_bind_devices`) and disagreeing chunk maps
+        (see ``ChunkStream.add``) *are* rejected because they cannot be resolved
+        without inventing a state that never existed.
+
+        Args:
+            sb_fhs: Images with their validated superblock copies.
+            member: Optional index into the supplied images, used to prefer one
+                device's superblock when several complete copies exist.
+        """
+        if member is not None:
+            if not 0 <= member < len(sb_fhs):
+                raise ValueError(f"member must be an index into the supplied images, got {member}")
+            return max((copy for copy in sb_fhs[member][1]), key=lambda copy: copy.generation)
+
+        newest = self._highest_generation(sb_fhs)
+        winners = sorted(
+            (copy for _, copies in sb_fhs for copy in copies if copy.generation == newest),
+            key=lambda copy: (copy.sb.dev_item.devid, copy.offset),
+        )
+        return winners[0]
+
+    def _bind_devices(self, sb_fhs: list[tuple[BinaryIO, list[SuperblockCopy]]]) -> None:
+        """Bind each supplied image to exactly one device identity, refusing duplicate devids."""
+        devices: dict[int, BinaryIO] = {}
+        identities: dict[int, UUID] = {}
+        by_uuid: dict[UUID, int] = {}
+
+        for fh, copies in sb_fhs:
+            identities_on_image = {
+                (copy.sb.dev_item.devid, bytes(copy.sb.dev_item.uuid)) for copy in copies
+            }
+            if len(identities_on_image) > 1:
+                raise ConflictingDeviceError(
+                    f"Superblock mirrors on one image disagree on devid/dev_uuid: {identities_on_image}"
+                )
+
+            sb = copies[0].sb
+            devid = sb.dev_item.devid
+            dev_uuid = UUID(bytes=bytes(sb.dev_item.uuid))
+
+            if devid in devices:
+                raise ConflictingDeviceError(
+                    f"devid {devid} is present on more than one image "
+                    f"(dev_uuid {identities[devid]} and {dev_uuid}); refusing to choose one"
+                )
+
+            if dev_uuid in by_uuid and by_uuid[dev_uuid] != devid:
+                raise ConflictingDeviceError(
+                    f"dev_uuid {dev_uuid} is claimed with devid {by_uuid[dev_uuid]} and {devid}"
+                )
+
+            devices[devid] = fh
+            identities[devid] = dev_uuid
+            by_uuid[dev_uuid] = devid
+
+        self.devices = devices
+        self.device_uuids = identities
+
+    def resolve_device(self, devid: int, dev_uuid: UUID) -> tuple[BinaryIO | None, UUID]:
+        """Resolve a chunk stripe's devid to a supplied image.
+
+        The stripe's ``dev_uuid`` must match the device identity claimed by that
+        image's superblock.  This matters when only ``devid`` and offsets match
+        between two collections: reusing a device name for unrelated media must
+        not silently satisfy a stripe reference.
+        """
+        fh = self.devices.get(devid)
+        expected = self.device_uuids.get(devid)
+
+        if fh is not None and expected != dev_uuid:
+            raise ConflictingDeviceError(
+                f"Chunk references devid {devid} with dev_uuid {dev_uuid}, but the supplied image "
+                f"identifies as {expected}"
+            )
+
+        return fh, dev_uuid
+
+    def _verify_tree_block(
+        self,
+        address: int,
+        node: bytes,
+        header: c_btrfs.btrfs_header,
+        owner: int | None,
+        generation: int | None,
+        level: int | None,
+    ) -> None:
+        """Validate a tree block against its on-disk checksum and expected physical identity."""
+        if not self.strict:
+            return
+
+        if header.bytenr != address:
+            raise InvalidTreeBlockError(f"Tree block at {address:#x} claims bytenr {header.bytenr:#x}")
+
+        # With the metadata_uuid feature, tree blocks carry metadata_uuid in the
+        # header fsid field; otherwise they carry the filesystem fsid.
+        metadata_uuid = bytes(self.sb.metadata_uuid)
+        expected_fsid = metadata_uuid if any(metadata_uuid) else bytes(self.sb.fsid)
+        if bytes(header.fsid) != expected_fsid:
+            raise InvalidTreeBlockError(f"Tree block at {address:#x} has a different fsid")
+
+        if owner is not None and header.owner != owner:
+            raise InvalidTreeBlockError(f"Tree block at {address:#x} is owned by {header.owner}, expected {owner}")
+
+        if generation is not None and header.generation != generation:
+            raise InvalidTreeBlockError(
+                f"Tree block at {address:#x} has generation {header.generation}, expected {generation}"
+            )
+
+        if level is not None and header.level != level:
+            raise InvalidTreeBlockError(f"Tree block at {address:#x} has level {header.level}, expected {level}")
+
+        if self.sb.csum_type == 0:
+            stored = struct.unpack_from("<I", node, 0)[0]
+            if stored != (crc32c.update(0, node[0x20:]) & 0xFFFFFFFF):
+                raise InvalidTreeBlockError(f"Tree block at {address:#x} failed checksum validation")
+        else:
+            raise UnsupportedChecksumError(f"Unsupported superblock checksum type: {self.sb.csum_type}")
 
     def get(self, path: str | int, node: INode | None = None) -> INode:
         """Retrieve a Btrfs inode by path or inode number.
@@ -142,7 +405,13 @@ class Btrfs:
             if sys_chunk_array.tell() == self.sb.sys_chunk_array_size:
                 break
 
-        chunk_tree = BTree(self, root_offset=self.sb.chunk_root)
+        chunk_tree = BTree(
+            self,
+            root_offset=self.sb.chunk_root,
+            owner=BTRFS_CHUNK_TREE_OBJECTID,
+            generation=self.sb.chunk_root_generation,
+            level=self.sb.chunk_root_level,
+        )
         for item, data in chunk_tree.cursor().iter(
             objectid=c_btrfs.BTRFS_FIRST_CHUNK_TREE_OBJECTID,
             type=c_btrfs.BTRFS_CHUNK_ITEM_KEY,
@@ -160,7 +429,7 @@ class Btrfs:
         """
         _, data = self._root_tree.find(objectid, c_btrfs.BTRFS_ROOT_ITEM_KEY)
         root_item = c_btrfs.btrfs_root_item(data)
-        return BTree(self, root_item)
+        return BTree(self, root_item, owner=objectid)
 
     def _open_default_subvolume(self) -> Subvolume:
         """Find and open the subvolume that's configured as default."""

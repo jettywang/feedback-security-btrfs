@@ -28,7 +28,7 @@ from dissect.btrfs.c_btrfs import (
     BTRFS_RAID_ATTRIBUTES,
     c_btrfs,
 )
-from dissect.btrfs.exceptions import Error
+from dissect.btrfs.exceptions import ConflictingChunkError, MissingDeviceError
 
 if TYPE_CHECKING:
     from dissect.btrfs.btrfs import Btrfs
@@ -71,16 +71,26 @@ class ChunkStream(AlignedStream):
         This will iterate all stripes and link them to the appropriate devices.
         Allows for missing devices, if the RAID profile allows this.
 
+        A chunk that overlaps an already known chunk is only accepted if it maps
+        the same stripes to the same physical locations.  Silently keeping the
+        first or last copy would let two different transaction times produce one
+        logical view.
+
         Args:
             offset: The logical offset to add this chunk for.
             chunk: The chunk item to add.
         """
         chunk_idx = bisect_right(self._chunk_offsets, offset)
         if chunk_idx > 0:
-            # Check if we already have a chunk for this offset
             existing_chunk = self.chunks[chunk_idx - 1]
             if existing_chunk.offset <= offset and existing_chunk.offset + existing_chunk.length > offset:
+                self._check_compatible(existing_chunk, offset, chunk)
                 return
+        if chunk_idx < len(self.chunks) and offset + chunk.length > self.chunks[chunk_idx].offset:
+            raise ConflictingChunkError(
+                f"Chunk at {offset:#x} (length {chunk.length:#x}) overlaps chunk at "
+                f"{self.chunks[chunk_idx].offset:#x}"
+            )
 
         ncopies, nparity, tolerated_failures = BTRFS_RAID_ATTRIBUTES[chunk.type & BTRFS_BLOCK_GROUP_PROFILE_MASK]
         data_stripes = (chunk.num_stripes - nparity) // ncopies
@@ -88,14 +98,15 @@ class ChunkStream(AlignedStream):
         stripes = []
         missing_devices = 0
         for stripe in chunk.stripe:
-            fh = self.btrfs.devices.get(stripe.devid)
-            dev_uuid = UUID(bytes=stripe.dev_uuid)
+            fh, dev_uuid = self.btrfs.resolve_device(stripe.devid, UUID(bytes=bytes(stripe.dev_uuid)))
 
             if fh is None:
                 if missing_devices < tolerated_failures:
                     missing_devices += 1
                 else:
-                    raise Error(f"Missing stripe disk for chunk offset {offset:#x}: {stripe.devid} ({dev_uuid})")
+                    raise MissingDeviceError(
+                        f"Missing stripe disk for chunk offset {offset:#x}: devid {stripe.devid} ({dev_uuid})"
+                    )
 
             stripe = Stripe(fh, stripe.offset, stripe.devid, dev_uuid)
             stripes.append(stripe)
@@ -114,6 +125,23 @@ class ChunkStream(AlignedStream):
         idx = bisect_right(self._chunk_offsets, offset)
         self._chunk_offsets.insert(idx, offset)
         self.chunks.insert(idx, chunk)
+
+    @staticmethod
+    def _check_compatible(existing: Chunk, offset: int, chunk: c_btrfs.btrfs_chunk) -> None:
+        expected = [(stripe.devid, stripe.offset) for stripe in chunk.stripe]
+        actual = [(stripe.devid, stripe.offset) for stripe in existing.stripes]
+        if (
+            existing.offset != offset
+            or existing.length != chunk.length
+            or existing.stripe_length != chunk.stripe_len
+            or existing.type != chunk.type
+            or existing.num_stripes != chunk.num_stripes
+            or existing.sub_stripes != chunk.sub_stripes
+            or actual != expected
+        ):
+            raise ConflictingChunkError(
+                f"Chunk at {offset:#x} disagrees with the already mapped chunk at {existing.offset:#x}"
+            )
 
     def _read(self, offset: int, length: int) -> bytes:
         r = []
