@@ -22,7 +22,7 @@ from dissect.btrfs.exceptions import (
     NotADirectoryError,
     NotASymlinkError,
 )
-from dissect.btrfs.stream import ChunkStream, Extent, ExtentStream, decode_extent
+from dissect.btrfs.stream import ChunkStream, Extent, ExtentCache, ExtentStream, decode_extent
 from dissect.btrfs.tree import BTree
 
 if TYPE_CHECKING:
@@ -38,9 +38,10 @@ class Btrfs:
 
     Args:
         fh: A file-like object for the volume to use for parsing Btrfs.
+        extent_cache_size: The maximum total size in bytes of decoded extent data to cache.
     """
 
-    def __init__(self, fh: BinaryIO | list[BinaryIO]):
+    def __init__(self, fh: BinaryIO | list[BinaryIO], extent_cache_size: int = 64 * 1024 * 1024):
         self.fhs = fh if isinstance(fh, list) else [fh]
 
         if not self.fhs:
@@ -72,6 +73,10 @@ class Btrfs:
 
         self._open_tree = lru_cache(32)(self._open_tree)
         self.open_subvolume = lru_cache(16)(self.open_subvolume)
+
+        # Decoded extent data is shared between all file views of this filesystem, e.g. snapshots
+        # referencing the same compressed extent. Keyed by on-disk identity, so never share between images.
+        self._extent_cache = ExtentCache(extent_cache_size)
 
         self._logical_fh = ChunkStream(self)
         self._initialize_chunks()
@@ -586,7 +591,9 @@ class INode:
         if offset < self.size:
             extents.append(Extent(0, 0, 0, 0, 0, self.size - offset))
 
-        return ExtentStream(self.btrfs._logical_fh, extents, self.size, self.btrfs.sector_size)
+        return ExtentStream(
+            self.btrfs._logical_fh, extents, self.size, self.btrfs.sector_size, self.btrfs._extent_cache
+        )
 
 
 def _parse_ts(timespec: c_btrfs.btrfs_timespec) -> int:

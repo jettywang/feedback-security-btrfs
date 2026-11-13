@@ -4,6 +4,7 @@ import io
 import sys
 import zlib
 from bisect import bisect_right
+from collections import OrderedDict
 from typing import TYPE_CHECKING, BinaryIO, NamedTuple
 from uuid import UUID
 
@@ -208,6 +209,69 @@ class Extent(NamedTuple):
     length: int
 
 
+class ExtentCache:
+    """A size-bounded LRU cache for decoded (decompressed) extent data.
+
+    Multiple file views (:class:`ExtentStream`) can share a single cache instance, for example when multiple
+    snapshots reference the same compressed extent on disk. Each view keeps its own extent offset and length,
+    only the decoded data of the compressed object is shared.
+
+    Cache entries are keyed by the on-disk identity of the compressed object, so instances of this class
+    must not be shared between different filesystem images.
+
+    Args:
+        max_size: The maximum total size in bytes of decoded extent data to cache.
+    """
+
+    def __init__(self, max_size: int = 64 * 1024 * 1024):
+        self.max_size = max_size
+        self._cache: OrderedDict[tuple[int, int, int, int], bytes] = OrderedDict()
+        self._size = 0
+
+    def __len__(self) -> int:
+        return len(self._cache)
+
+    @property
+    def size(self) -> int:
+        """Return the current total size in bytes of cached extent data."""
+        return self._size
+
+    @staticmethod
+    def key(extent: Extent) -> tuple[int, int, int, int]:
+        """Return the cache key identifying the compressed object of an extent on disk."""
+        return (extent.disk_offset, extent.disk_length, extent.compression, extent.encryption)
+
+    def get(self, key: tuple[int, int, int, int]) -> bytes | None:
+        """Return the cached decoded data for a key, or ``None`` if not cached."""
+        try:
+            buf = self._cache.pop(key)
+        except KeyError:
+            return None
+
+        self._cache[key] = buf
+        return buf
+
+    def set(self, key: tuple[int, int, int, int], buf: bytes) -> None:
+        """Cache decoded extent data, evicting least recently used entries to stay within ``max_size``."""
+        if len(buf) > self.max_size:
+            return
+
+        if key in self._cache:
+            self._size -= len(self._cache.pop(key))
+
+        while self._size + len(buf) > self.max_size:
+            _, evicted = self._cache.popitem(last=False)
+            self._size -= len(evicted)
+
+        self._cache[key] = buf
+        self._size += len(buf)
+
+    def clear(self) -> None:
+        """Clear all cached extent data."""
+        self._cache.clear()
+        self._size = 0
+
+
 class ExtentStream(AlignedStream):
     """Implement a stream over Btrfs file extents.
 
@@ -217,9 +281,17 @@ class ExtentStream(AlignedStream):
         fh: The file-like object to read the data from, usually the :class:`ChunkStream` of the filesystem.
         extents: The list of extents to open the stream on.
         sector_size: The sector size of the filesystem, necessary for LZO decompression.
+        cache: Optional :class:`ExtentCache` to reuse decoded extent data between streams.
     """
 
-    def __init__(self, fh: BinaryIO, extents: list[Extent], size: int, sector_size: int):
+    def __init__(
+        self,
+        fh: BinaryIO,
+        extents: list[Extent],
+        size: int,
+        sector_size: int,
+        cache: ExtentCache | None = None,
+    ):
         self._fh = fh
 
         self.extents = extents
@@ -232,6 +304,7 @@ class ExtentStream(AlignedStream):
             offset += extent.length
 
         self.sector_size = sector_size
+        self._cache = cache
 
         super().__init__(size, sector_size)
 
@@ -273,13 +346,21 @@ class ExtentStream(AlignedStream):
                     self._fh.seek(extent.disk_offset + extent_pos)
                     buf = self._fh.read(read_count)
                 else:
-                    self._fh.seek(extent.disk_offset)
-                    buf = decode_extent(
-                        self._fh.read(extent.disk_length),
-                        extent.compression,
-                        extent.encryption,
-                        self.sector_size,
-                    )
+                    cache_key = ExtentCache.key(extent) if self._cache is not None else None
+                    buf = self._cache.get(cache_key) if cache_key is not None else None
+
+                    if buf is None:
+                        self._fh.seek(extent.disk_offset)
+                        # A decode failure propagates here, so failed decodes are never cached
+                        buf = decode_extent(
+                            self._fh.read(extent.disk_length),
+                            extent.compression,
+                            extent.encryption,
+                            self.sector_size,
+                        )
+
+                        if cache_key is not None:
+                            self._cache.set(cache_key, buf)
 
                     if extent_pos or read_count != len(buf):
                         buf = buf[extent_pos : extent_pos + read_count]
