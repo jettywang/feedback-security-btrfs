@@ -16,7 +16,9 @@ from dissect.util.hash import crc32c
 from dissect.util.stream import BufferedStream
 
 from dissect.btrfs.c_btrfs import FT_MAP, c_btrfs
+from dissect.btrfs.checksum import ChecksumStatus, ChecksumStream, ChecksumTree
 from dissect.btrfs.exceptions import (
+    ChecksumError,
     Error,
     FileNotFoundError,
     NotADirectoryError,
@@ -82,6 +84,14 @@ class Btrfs:
 
         self.default_subvolume = self._open_default_subvolume()
         self.root = self.default_subvolume.root
+
+    @cached_property
+    def checksum_tree(self) -> ChecksumTree | None:
+        """Return the checksum tree of this filesystem, or ``None`` if it's unavailable."""
+        try:
+            return ChecksumTree(self)
+        except KeyError:
+            return None
 
     def get(self, path: str | int, node: INode | None = None) -> INode:
         """Retrieve a Btrfs inode by path or inode number.
@@ -587,6 +597,57 @@ class INode:
             extents.append(Extent(0, 0, 0, 0, 0, self.size - offset))
 
         return ExtentStream(self.btrfs._logical_fh, extents, self.size, self.btrfs.sector_size)
+
+    def open_verified(self) -> ChecksumStream:
+        """Return a checksum-verifying data stream for the inode.
+
+        The returned stream verifies the complete checksum units that every read depends on against
+        the checksum tree of the filesystem:
+
+        - uncompressed extents are verified per sector covering the requested range;
+        - compressed extents are verified over their entire on-disk (compressed) size before decoding,
+          disk checksums are never applied to decompressed slices;
+        - ranges without checksum records (holes, inline data, NODATASUM files) are reported as
+          :attr:`~dissect.btrfs.checksum.ChecksumStatus.NOT_COVERED`, which is not a successful verification.
+
+        A checksum mismatch raises :class:`~dissect.btrfs.exceptions.ChecksumError`. The verification
+        results of everything read so far are queryable through the ``results`` and ``status`` attributes
+        of the returned stream.
+        """
+        fh = self.open()
+        if isinstance(fh, ExtentStream):
+            return ChecksumStream(
+                self.btrfs._logical_fh,
+                fh.extents,
+                self.size,
+                self.btrfs.sector_size,
+                checksum_tree=self.btrfs.checksum_tree,
+            )
+
+        # Inline and empty files have no data checksum records
+        return ChecksumStream(
+            self.btrfs._logical_fh,
+            [],
+            self.size,
+            self.btrfs.sector_size,
+            checksum_tree=self.btrfs.checksum_tree,
+            inline_data=fh.read(),
+        )
+
+    def verify(self) -> ChecksumStatus:
+        """Read the entire file and return the aggregated checksum verification status.
+
+        Note that files without data checksum records (e.g. NODATASUM or inline files) return
+        :attr:`~dissect.btrfs.checksum.ChecksumStatus.NOT_COVERED`, not
+        :attr:`~dissect.btrfs.checksum.ChecksumStatus.VERIFIED`.
+        """
+        with self.open_verified() as fh:
+            try:
+                while fh.read(1024 * 1024):
+                    pass
+            except ChecksumError:
+                pass
+            return fh.status
 
 
 def _parse_ts(timespec: c_btrfs.btrfs_timespec) -> int:
