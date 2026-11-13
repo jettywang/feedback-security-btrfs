@@ -241,42 +241,67 @@ class Subvolume:
             return self.inode(path)
 
         node = node or self.root
-        subvolume = self
 
         parts = path.encode().split(b"/")
 
         for part in parts:
-            if not part:
-                continue
-
-            if part == b".":
+            if not part or part == b".":
                 continue
 
             if part == b"..":
+                # Never resolve ".." outside of the inode hierarchy of this filesystem.
+                # If the node has no parent (e.g. the root of a separately opened
+                # subvolume), stay at that node instead of escaping to the host.
                 node = node.parent or node
                 continue
 
             while node.is_symlink():
                 node = node.link_inode
 
+            # The tree to search in is determined by the subvolume of the current node.
+            # This correctly switches context when a path crosses subvolume boundaries,
+            # e.g. when ".." returns from a subvolume to its parent directory.
+            subvolume = node.subvolume
+
             # The Linux kernel doesn't do an initial and final XOR with 0xFFFFFFFF
             # Btrfs uses an initial CRC of `(u32)~1`, which is effectively the same as 1 XOR 0xFFFFFFFF
             # We still need to invert the XOR of the result though
             # https://stackoverflow.com/a/40433980
             part_hash = (crc32c.update(1, part) ^ 0xFFFFFFFF) & 0xFFFFFFFF
-            try:
-                _, data = subvolume.tree.find(node.inum, c_btrfs.BTRFS_DIR_ITEM_KEY, part_hash)
-            except KeyError:
-                raise FileNotFoundError(f"File not found: {path}")
 
-            dir_item = c_btrfs.btrfs_dir_item(data)
+            # Multiple directory entries can share the same name hash. Btrfs stores these as
+            # consecutive records in the data of a single BTRFS_DIR_ITEM_KEY item, so iterate
+            # all records of all items with this hash and strictly match on the name.
+            dir_item = None
+            for _, data in subvolume.tree.cursor().iter(node.inum, c_btrfs.BTRFS_DIR_ITEM_KEY, part_hash):
+                try:
+                    for candidate in _iter_dir_items(data):
+                        if candidate.name == part:
+                            dir_item = candidate
+                            break
+                except EOFError as e:
+                    raise Error(
+                        f"Corrupt dir_item in directory inode {node.inum} of subvolume "
+                        f"{subvolume.objectid} while resolving component {part!r} of path {path!r}"
+                    ) from e
+
+                if dir_item is not None:
+                    break
+
+            if dir_item is None:
+                raise FileNotFoundError(
+                    f"File not found: {path} "
+                    f"(no entry {part!r} in directory inode {node.inum} of subvolume {subvolume.objectid})"
+                )
+
             dir_item_type = dir_item.location.type
 
             if dir_item_type == c_btrfs.BTRFS_ROOT_ITEM_KEY:
-                subvolume = self.btrfs.open_subvolume(dir_item.location.objectid, subvolume)
-                node = subvolume.root
+                # Attach the subvolume root to the directory inode it was found in,
+                # so that ".." from the subvolume root returns to this directory.
+                node = self.btrfs.open_subvolume(dir_item.location.objectid, node).root
             elif dir_item_type == c_btrfs.BTRFS_INODE_ITEM_KEY:
-                node = subvolume.inode(dir_item.location.objectid, dir_item.type, subvolume)
+                node = subvolume.inode(dir_item.location.objectid, dir_item.type, node)
             else:
                 raise NotImplementedError(f"Unknown dir_item type: {dir_item}")
 
@@ -587,6 +612,19 @@ class INode:
             extents.append(Extent(0, 0, 0, 0, 0, self.size - offset))
 
         return ExtentStream(self.btrfs._logical_fh, extents, self.size, self.btrfs.sector_size)
+
+
+def _iter_dir_items(data: memoryview) -> Iterator[c_btrfs.btrfs_dir_item]:
+    """Iterate all ``btrfs_dir_item`` records packed in the data of a single tree item.
+
+    Directory entries with colliding name hashes are stored as consecutive
+    records under the same ``BTRFS_DIR_ITEM_KEY`` key.
+    """
+    offset = 0
+    while offset < len(data):
+        dir_item = c_btrfs.btrfs_dir_item(data[offset:])
+        yield dir_item
+        offset += len(dir_item)
 
 
 def _parse_ts(timespec: c_btrfs.btrfs_timespec) -> int:

@@ -2,14 +2,17 @@ from __future__ import annotations
 
 import datetime
 import hashlib
+import io
+import struct
 from typing import BinaryIO
 
 import pytest
+from dissect.util.hash import crc32c
 from dissect.util.stream import BufferedStream
 
 from dissect.btrfs.btrfs import Btrfs
 from dissect.btrfs.c_btrfs import c_btrfs
-from dissect.btrfs.exceptions import Error
+from dissect.btrfs.exceptions import Error, FileNotFoundError
 
 
 def assert_test_data(fs: Btrfs) -> None:
@@ -131,6 +134,87 @@ def test_btrfs_subvolume_nested(btrfs_subvolume_nested: BinaryIO) -> None:
     ]
 
     assert fs.find_subvolume("default/volume").objectid == 258
+
+
+def test_btrfs_subvolume_dotdot_context(btrfs_subvolume_nested: BinaryIO) -> None:
+    """Entering a subvolume and returning with ".." must switch back to the parent tree.
+
+    The parent and child subvolumes deliberately share inode numbers (all roots are 256)
+    and directory names ("volume" exists in multiple subvolumes).
+    """
+    fs = Btrfs(btrfs_subvolume_nested)
+
+    root = fs.get("")
+    assert (root.subvolume.objectid, root.inum) == (257, 256)
+
+    entry = fs.get("volume")
+    assert (entry.subvolume.objectid, entry.inum) == (258, 256)
+
+    # ".." from the subvolume root returns to the parent directory in the parent subvolume
+    parent = fs.get("volume/..")
+    assert (parent.subvolume.objectid, parent.inum) == (257, 256)
+
+    # re-entering after returning resolves in the parent tree again
+    again = fs.get("volume/../volume")
+    assert (again.subvolume.objectid, again.inum) == (258, 256)
+
+    # full path lookup, segment-wise lookup and directory enumeration must agree
+    segment = fs.get("volume").get("..")
+    assert (segment.subvolume.objectid, segment.inum) == (257, 256)
+
+    listing = fs.get("volume/..").listdir()
+    assert (listing["volume"].subvolume.objectid, listing["volume"].inum) == (258, 256)
+    assert (listing[".."].subvolume.objectid, listing[".."].inum) == (257, 256)
+
+    # ".." at the root of a separately opened subvolume stays at that root
+    subvolume = fs.open_subvolume(258)
+    assert (subvolume.get("..").subvolume.objectid, subvolume.get("..").inum) == (258, 256)
+    assert (subvolume.get("../..").subvolume.objectid, subvolume.get("../..").inum) == (258, 256)
+
+
+def test_btrfs_subvolume_dotdot_content(btrfs_subvolume: BinaryIO) -> None:
+    """Reading after crossing into a subvolume and back must return parent volume data."""
+    fs = Btrfs(btrfs_subvolume)
+
+    parent_small = fs.get("small.txt")
+    subvol_small = fs.get("subvol/small.txt")
+    assert parent_small.open().read() == b"small file content goes here\n"
+    assert subvol_small.open().read() == b"file in subvolume\n"
+
+    # cross into the subvolume and return to the parent volume
+    entry = fs.get("subvol/../small.txt")
+    assert (entry.subvolume.objectid, entry.inum) == (parent_small.subvolume.objectid, parent_small.inum)
+    assert entry.open().read() == b"small file content goes here\n"
+
+    # ".." stays within the subvolume until it crosses the subvolume root
+    entry = fs.get("subvol/some/more/dirs/../../../small.txt")
+    assert (entry.subvolume.objectid, entry.inum) == (subvol_small.subvolume.objectid, subvol_small.inum)
+    assert entry.open().read() == b"file in subvolume\n"
+
+    entry = fs.get("subvol/some/more/dirs/../../../../small.txt")
+    assert (entry.subvolume.objectid, entry.inum) == (parent_small.subvolume.objectid, parent_small.inum)
+    assert entry.open().read() == b"small file content goes here\n"
+
+    # segment-wise lookup and enumeration agree with the full path lookup
+    entry = fs.get("subvol").get("..").get("small.txt")
+    assert (entry.subvolume.objectid, entry.inum) == (parent_small.subvolume.objectid, parent_small.inum)
+
+    listing = fs.get("subvol/..").listdir()
+    assert (listing["small.txt"].subvolume.objectid, listing["small.txt"].inum) == (
+        parent_small.subvolume.objectid,
+        parent_small.inum,
+    )
+
+
+def test_btrfs_get_not_found_diagnostics(btrfs_default: BinaryIO) -> None:
+    """A failed lookup must report the path, component, directory inode and subvolume."""
+    fs = Btrfs(btrfs_default)
+
+    with pytest.raises(
+        FileNotFoundError,
+        match=r"File not found: nonexistent \(no entry b'nonexistent' in directory inode 256 of subvolume 5\)",
+    ):
+        fs.get("nonexistent")
 
 
 def test_btrfs_subvolume_snapshot(btrfs_subvolume_snapshot: BinaryIO) -> None:
@@ -278,3 +362,121 @@ def test_btrfs_sparse(btrfs_sparse: BinaryIO) -> None:
     assert entry.open().read() == (b"\x01" * (4096 + 123)) + (b"\x02") + (b"\x01" * ((4096 * 19) - 124)) + (
         (b"\x00" * 4096) * 40
     )
+
+
+def _build_dir_item(objectid: int, name: bytes, type: int = c_btrfs.BTRFS_FT_REG_FILE) -> bytes:
+    """Build a raw ``btrfs_dir_item`` record."""
+    location = struct.pack("<QBQ", objectid, c_btrfs.BTRFS_INODE_ITEM_KEY, 0)
+    return location + struct.pack("<QHHB", 5, 0, len(name), type) + name
+
+
+def _pack_dir_item_records(image: bytes, name: bytes, records: list[bytes]) -> BinaryIO:
+    """Return a copy of a filesystem image where the ``BTRFS_DIR_ITEM_KEY`` item for ``name``
+    in the root directory of the default subvolume is replaced by the given packed records.
+
+    This emulates how Btrfs stores directory entries with colliding name hashes:
+    as consecutive ``btrfs_dir_item`` records in the data of a single tree item.
+    Node checksums are not verified by the parser, so the image remains readable.
+    """
+    fs = Btrfs(io.BytesIO(image))
+    root = fs.root
+    name_hash = (crc32c.update(1, name) ^ 0xFFFFFFFF) & 0xFFFFFFFF
+
+    cursor = fs.default_subvolume.tree.cursor()
+    if not next(cursor.iter(root.inum, c_btrfs.BTRFS_DIR_ITEM_KEY, name_hash), None):
+        raise ValueError(f"No dir_item for {name!r} in image")
+
+    # Locate the tree node in the raw image by its fsid + logical address header fields
+    raw = bytearray(image)
+    needle = fs.uuid.bytes + struct.pack("<Q", cursor._header.bytenr)
+    node_offset = raw.find(needle) - c_btrfs.BTRFS_CSUM_SIZE
+    if node_offset < 0:
+        raise ValueError("Can't locate tree node in image")
+
+    header_size = len(c_btrfs.btrfs_header)
+    item_size = len(c_btrfs.btrfs_item)
+    node = raw[node_offset : node_offset + fs.node_size]
+    header = c_btrfs.btrfs_header(node)
+
+    packed = b"".join(records)
+
+    # Relocate the item data to the free space between the item array and the item data area
+    # Item data offsets are relative to the end of the node header
+    data_offsets = []
+    for index in range(header.nritems):
+        item_offset = header_size + (index * item_size)
+        item = c_btrfs.btrfs_item(node[item_offset : item_offset + item_size])
+        data_offsets.append(item.offset)
+
+        if (item.key.objectid, item.key.type, item.key.offset) == (root.inum, c_btrfs.BTRFS_DIR_ITEM_KEY, name_hash):
+            target_item_offset = item_offset
+
+    new_data_offset = min(data_offsets) - len(packed)
+    if new_data_offset < header.nritems * item_size:
+        raise ValueError("Not enough free space in tree node")
+
+    raw[node_offset + header_size + new_data_offset : node_offset + header_size + new_data_offset + len(packed)] = (
+        packed
+    )
+    struct.pack_into("<I", raw, node_offset + target_item_offset + len(c_btrfs.btrfs_disk_key), new_data_offset)
+    struct.pack_into("<I", raw, node_offset + target_item_offset + len(c_btrfs.btrfs_disk_key) + 4, len(packed))
+
+    return io.BytesIO(bytes(raw))
+
+
+def test_btrfs_dir_item_hash_collision(btrfs_default: BinaryIO) -> None:
+    """Multiple name records under one DIR_ITEM hash must be matched by name, not by position."""
+    image = btrfs_default.read()
+    fs = Btrfs(io.BytesIO(image))
+    small = fs.get("small.txt")
+    large = fs.get("large.txt")
+
+    # An impostor record for a different name is stored first under the hash of "small.txt",
+    # followed by the real record for "small.txt"
+    records = [
+        _build_dir_item(large.inum, b"impostor"),
+        _build_dir_item(small.inum, b"small.txt"),
+    ]
+    fs = Btrfs(_pack_dir_item_records(image, b"small.txt", records))
+
+    # full path lookup must skip the impostor and find the real record
+    entry = fs.get("small.txt")
+    assert (entry.subvolume.objectid, entry.inum) == (small.subvolume.objectid, small.inum)
+    assert entry.open().read() == b"small file content goes here\n"
+
+    # segment-wise lookup and directory enumeration must agree with the full path lookup
+    segment = fs.get("").get("small.txt")
+    assert (segment.subvolume.objectid, segment.inum) == (entry.subvolume.objectid, entry.inum)
+
+    listing = fs.get("").listdir()
+    assert (listing["small.txt"].subvolume.objectid, listing["small.txt"].inum) == (
+        entry.subvolume.objectid,
+        entry.inum,
+    )
+
+    # the impostor name itself does not resolve
+    with pytest.raises(FileNotFoundError, match=r"no entry b'impostor'"):
+        fs.get("impostor")
+
+
+def test_btrfs_dir_item_corrupt_collision(btrfs_default: BinaryIO) -> None:
+    """A corrupt record under a shared DIR_ITEM hash must not let another record impersonate the target."""
+    image = btrfs_default.read()
+    fs = Btrfs(io.BytesIO(image))
+    large = fs.get("large.txt")
+
+    # The first record is a valid impostor pointing to a different inode,
+    # the second record is corrupt and can not be parsed
+    records = [
+        _build_dir_item(large.inum, b"impostor"),
+        b"\xde\xad\xbe\xef",
+    ]
+    fs = Btrfs(_pack_dir_item_records(image, b"small.txt", records))
+
+    # the lookup must fail with a locatable diagnostic instead of returning the impostor
+    with pytest.raises(
+        Error,
+        match=r"Corrupt dir_item in directory inode 256 of subvolume 5 "
+        r"while resolving component b'small\.txt' of path 'small\.txt'",
+    ):
+        fs.get("small.txt")
