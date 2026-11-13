@@ -84,7 +84,11 @@ class Cursor:
         self.reset()
 
     def reset(self) -> None:
-        """Reset the cursor."""
+        """Reset the cursor.
+
+        The cursor is left unpositioned at the root of the tree. Use :meth:`search`, :meth:`first`,
+        :meth:`last` or :meth:`iter` to position it on a leaf item.
+        """
         self._node = None
         self._header = None
         self._keys = {}
@@ -92,6 +96,15 @@ class Cursor:
         self._index = None
         self._path = []
         self.push(self.btree.root_offset)
+        self._index = None
+
+    def _restore(self, state: tuple) -> None:
+        """Restore a cursor position previously captured with :meth:`_state`."""
+        self._node, self._header, self._keys, self._items, self._index, self._path = state
+
+    def _state(self) -> tuple:
+        """Capture the current cursor position so it can be restored after a failed query."""
+        return (self._node, self._header, self._keys, self._items, self._index, list(self._path))
 
     def push(self, address: int, initial_index: int = 0) -> None:
         """Push the cursor down a node.
@@ -105,7 +118,7 @@ class Cursor:
         self._node, self._header = self.btree._read_node(address)
         self._keys = {}
         self._items = {}
-        self._index = self._header.nritems if initial_index == -1 else initial_index
+        self._index = self._header.nritems - 1 if initial_index == -1 else initial_index
 
     def pop(self) -> None:
         """Pop up a node."""
@@ -159,11 +172,15 @@ class Cursor:
         """Traverse to the next node.
 
         Will move up and down the tree to find the next node.
+        Raises ``ValueError`` when there is no next node, leaving the cursor at its last position.
         """
+        state = self._state()
+
         while self._index is not None and self._index + 1 >= self._header.nritems:
             self.pop()
 
         if self._index is None:
+            self._restore(state)
             raise ValueError("Reached end")
 
         self._index += 1
@@ -180,14 +197,18 @@ class Cursor:
             self.push(self.item().blockptr, -1)
 
     def prev_node(self) -> None:
-        """Traverse to the previous leaf item.
+        """Traverse to the previous node.
 
-        Will move up and down the tree to find the previous leaf item.
+        Will move up and down the tree to find the previous node.
+        Raises ``ValueError`` when there is no previous node, leaving the cursor at its first position.
         """
+        state = self._state()
+
         while self._index is not None and self._index - 1 < 0:
             self.pop()
 
         if self._index is None:
+            self._restore(state)
             raise ValueError("Reached start")
 
         self._index -= 1
@@ -197,6 +218,7 @@ class Cursor:
     def first(self) -> None:
         """Move the cursor to the first leaf item."""
         self.reset()
+        self._index = 0
         while self._header.level:
             self.push(self.item().blockptr)
 
@@ -300,13 +322,19 @@ class Cursor:
         """Perform a binary search on the current node for the key with the given parameters.
 
         Puts the cursor at the index of the matching item, or just before a "greater" item if no exact match is found.
-        ``True`` is returned if this is the case, else ``False`` is returned and the cursor position is reset.
+        ``True`` is returned if this is the case, else ``False`` is returned and the cursor position is unchanged.
+
+        The search always starts at the root of the tree, so the result does not depend on where the cursor
+        currently is.
 
         Args:
             objectid: Optional object ID to search for.
             type: Optional type to search for.
             offset: Optional offset to search for.
         """
+        state = self._state()
+        self.reset()
+
         while True:
             min_idx = 0
             max_idx = self._header.nritems - 1
@@ -323,9 +351,11 @@ class Cursor:
 
             result = _cmp_key(self._read_key(min_idx), objectid, type, offset)
             if self._header.level:
-                if result > 0 and min_idx > 0:
-                    # When we're at a node level, and the next key is larger than what we're searching for, then
-                    # we must traverse down the previous node
+                if result >= 0 and min_idx > 0:
+                    # When we're at a node level, the previous child may still contain keys that are greater than
+                    # or equal to what we're searching for (e.g. when matching on a partial key), so traverse down
+                    # the previous node. If that subtree turns out to only contain smaller keys, ``next_node`` will
+                    # bring us back to the next child.
                     min_idx -= 1
                 self._index = min_idx
                 self.push(self._read_item(min_idx).blockptr)
@@ -345,12 +375,11 @@ class Cursor:
                     self.next_node()
                     continue
                 except ValueError:
-                    self._index = None
-                    return False
+                    break
 
             break
 
-        self._index = None
+        self._restore(state)
         return False
 
 
