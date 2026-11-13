@@ -214,6 +214,11 @@ class Cursor:
         """
         return self.item(), self.data()
 
+    @property
+    def node_bytenr(self) -> int | None:
+        """Return the logical address of the node the cursor is currently positioned at."""
+        return self._header.bytenr if self._header is not None else None
+
     def item(self) -> c_btrfs.btrfs_key_ptr | c_btrfs.btrfs_item:
         """Retrieve a leaf or branch item.
 

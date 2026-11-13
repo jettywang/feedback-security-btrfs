@@ -6,3 +6,4 @@ API Reference
     :glob:
 
     /api/*/*/index
+    reverse-extent

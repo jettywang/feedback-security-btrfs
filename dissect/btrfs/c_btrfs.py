@@ -779,6 +779,10 @@ struct btrfs_root_ref {
     char        name[name_len];
 };
 
+#define BTRFS_EXTENT_FLAG_DATA         (1 << 0)
+#define BTRFS_EXTENT_FLAG_TREE_BLOCK   (1 << 1)
+#define BTRFS_EXTENT_FLAG_FULL_BACKREF (1 << 2)
+
 enum {
     BTRFS_FILE_EXTENT_INLINE   = 0,
     BTRFS_FILE_EXTENT_REG      = 1,
@@ -792,6 +796,17 @@ enum {
     BTRFS_COMPRESS_LZO   = 2,
     BTRFS_COMPRESS_ZSTD  = 3,
     BTRFS_NR_COMPRESS_TYPES = 4,
+};
+
+struct btrfs_extent_item {
+    /* number of references to this extent */
+    uint64      refs;
+
+    /* transaction that created this extent */
+    uint64      generation;
+
+    /* BTRFS_EXTENT_FLAG_* */
+    uint64      flags;
 };
 
 struct btrfs_file_extent_item_inline {

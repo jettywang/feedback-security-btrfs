@@ -22,12 +22,15 @@ from dissect.btrfs.exceptions import (
     NotADirectoryError,
     NotASymlinkError,
 )
+from dissect.btrfs.reference import find_extent_references
 from dissect.btrfs.stream import ChunkStream, Extent, ExtentStream, decode_extent
 from dissect.btrfs.tree import BTree
 
 if TYPE_CHECKING:
-    from collections.abc import Iterator
+    from collections.abc import Iterable, Iterator
     from datetime import datetime
+
+    from dissect.btrfs.reference import ExtentReferenceReport
 
 
 class Btrfs:
@@ -92,6 +95,24 @@ class Btrfs:
         """
         return self.default_subvolume.get(path, node)
 
+    def find_extent_references(
+        self,
+        bytenr: int,
+        length: int,
+        subvolumes: Iterable[int | Subvolume],
+    ) -> ExtentReferenceReport:
+        """Find files that physically reference a logical disk range in selected subvolumes.
+
+        This is a read-only reverse lookup. Sharing is determined by extent allocation overlap only,
+        not by content equality. See :func:`dissect.btrfs.reference.find_extent_references`.
+
+        Args:
+            bytenr: Query start in Btrfs logical disk coordinates.
+            length: Query length in bytes.
+            subvolumes: Explicit subvolume roots (object IDs or :class:`Subvolume` instances) to scan.
+        """
+        return find_extent_references(self, bytenr, length, subvolumes)
+
     def subvolumes(self) -> Iterator[Subvolume]:
         """Yield all subvolumes."""
         yield self.fs_tree
@@ -151,6 +172,11 @@ class Btrfs:
         ):
             chunk = c_btrfs.btrfs_chunk(data)
             self._logical_fh.add(item.key.offset, chunk)
+
+    @cached_property
+    def extent_tree(self) -> BTree:
+        """Return the extent tree, which records allocations and their reference counts."""
+        return self._open_tree(c_btrfs.BTRFS_EXTENT_TREE_OBJECTID)
 
     def _open_tree(self, objectid: int) -> BTree:
         """Open a tree by object ID.
